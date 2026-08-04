@@ -83,6 +83,8 @@ local State = {
 }
 
 local cd = { plant = 0, water = 0, spr = 0, sell = 0, buy = 0, harv = 0 }
+local plantBlockedUntil = 0
+local sprBlockedUntil = 0
 local UI = {}
 
 ------------------------------------------------------------------------
@@ -196,12 +198,27 @@ end
 local function worldGears()
 	local wid, list = worldId(), {}
 	for _, d in ipairs(GearShopData.Data) do
-		if not d.HideFromShop and gearFits(d.ItemName, wid) then
-			if string.find(d.ItemName, "Sprinkler", 1, true) or string.find(d.ItemName, "Watering", 1, true) then
-				table.insert(list, { name = d.ItemName, image = d.IMG })
-			end
+		if d.HideFromShop or not d.ItemName then
+			continue
+		end
+		-- show everything the gear shop sells for this world
+		local ok = true
+		if type(d.Worlds) == "table" then
+			ok = seedInWorld(d, wid)
+		else
+			ok = gearFits(d.ItemName, wid)
+		end
+		if ok then
+			table.insert(list, {
+				name = d.ItemName,
+				image = d.IMG or "",
+				cost = tonumber(d.Cost) or 0,
+			})
 		end
 	end
+	table.sort(list, function(a, b)
+		return (a.cost or 0) < (b.cost or 0)
+	end)
 	return list
 end
 
@@ -713,6 +730,7 @@ local function ensureSprinkler(plot, plotId)
 	end
 	local active = mySpr(plot)
 	if #active > 0 then
+		sprBlockedUntil = 0
 		local ok, pos = pcall(function()
 			return active[1]:GetPivot().Position
 		end)
@@ -721,9 +739,25 @@ local function ensureSprinkler(plot, plotId)
 		end
 		return sprCenters(plot)
 	end
+	-- already tried recently and couldn't place — wait until we can again
+	if os.clock() < sprBlockedUntil then
+		return sprCenters(plot)
+	end
+	local tool = findTool("Sprinkler", State.selectedSprinkler) or findAny("Sprinkler")
+	if not tool then
+		sprBlockedUntil = os.clock() + 6
+		setStatus("No sprinkler")
+		return sprCenters(plot)
+	end
 	local pos = State.lastSprinklerPos or plotCenter(plot)
-	if pos then
-		placeSpr(pos, plotId)
+	if not pos then
+		sprBlockedUntil = os.clock() + 4
+		return sprCenters(plot)
+	end
+	if placeSpr(pos, plotId) then
+		sprBlockedUntil = 0
+	else
+		sprBlockedUntil = os.clock() + 5
 	end
 	return sprCenters(plot)
 end
@@ -819,6 +853,7 @@ local function tryHarvest()
 			end) then
 				State.harvested += 1
 				n += 1
+				plantBlockedUntil = 0 -- room may have opened
 				setStatus(isMutated(plant) and "Harvested mutant" or "Harvested")
 			end
 			task.wait(0.05)
@@ -861,26 +896,48 @@ local function tryHarvest()
 end
 
 local function tryPlant()
-	if not State.autoPlant or not State.selectedPlant or os.clock() - cd.plant < 0.12 then
+	if not State.autoPlant or not State.selectedPlant then
+		return
+	end
+	-- garden/circle full — don't spam plant/sprinkler until space opens up
+	if os.clock() < plantBlockedUntil then
+		return
+	end
+	if os.clock() - cd.plant < 0.12 then
 		return
 	end
 	local plot, plotId = getPlot()
 	if not plot then
 		return
 	end
-	-- sprinkler first at plot center, then only plant inside its radius
-	if State.useSprinklers then
-		ensureSprinkler(plot, plotId)
-	end
 	local tool = findTool("SeedTool", State.selectedPlant)
 	if not tool then
+		plantBlockedUntil = os.clock() + 4
 		setStatus("No seeds")
 		return
 	end
+	-- check for a free spot before touching sprinklers
 	local spot = nextSpot(plot)
 	if not spot then
-		setStatus(State.useSprinklers and "Sprinkler circle full" or "Garden full")
+		plantBlockedUntil = os.clock() + 3.5
+		-- no room to plant → also pause sprinkler spam
+		if State.useSprinklers and #mySpr(plot) > 0 then
+			sprBlockedUntil = math.max(sprBlockedUntil, os.clock() + 3.5)
+		end
+		setStatus(State.useSprinklers and "Circle full · waiting" or "Garden full · waiting")
 		return
+	end
+	plantBlockedUntil = 0
+	-- sprinkler first at plot center, then plant inside its radius
+	if State.useSprinklers then
+		ensureSprinkler(plot, plotId)
+		-- re-resolve spot after sprinkler exists (must be inside circle)
+		spot = nextSpot(plot)
+		if not spot then
+			plantBlockedUntil = os.clock() + 3.5
+			setStatus("Circle full · waiting")
+			return
+		end
 	end
 	if not equip(tool) then
 		return
@@ -1966,7 +2023,12 @@ seedGrid.Parent = seedBox
 
 local gearCard2 = card(shop, 3)
 sect(gearCard2, "Gears", 1)
-local gearBox = hScroll(gearCard2, 110, 2)
+local gearBox = vScroll(gearCard2, 220, 2)
+local gearGrid = Instance.new("UIGridLayout")
+gearGrid.CellSize = UDim2.fromOffset(78, 90)
+gearGrid.CellPadding = UDim2.fromOffset(8, 8)
+gearGrid.SortOrder = Enum.SortOrder.LayoutOrder
+gearGrid.Parent = gearBox
 
 ------------------------------------------------------------------------
 -- SETTINGS
@@ -2088,9 +2150,14 @@ local function rebuild()
 	end
 
 	clear(gearBox)
-	for _, item in ipairs(worldGears()) do
+	for i, item in ipairs(worldGears()) do
 		local on = State.buyGears[item.name]
-		local t = tile(gearBox, item.image, item.name:gsub(" Sprinkler", ""):gsub(" Watering Can", " Can"):gsub("Syrup ", "Syr "), on, 90, 100)
+		local labelText = item.name
+			:gsub(" Sprinkler", "")
+			:gsub(" Watering Can", " Can")
+			:gsub("Syrup ", "Syr ")
+		local t = tile(gearBox, item.image, labelText, on)
+		t.LayoutOrder = i
 		t.MouseButton1Click:Connect(function()
 			if State.buyGears[item.name] then
 				State.buyGears[item.name] = nil
