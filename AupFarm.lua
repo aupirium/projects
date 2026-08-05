@@ -15,8 +15,6 @@ local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
 local Networking = require(ReplicatedStorage.SharedModules.Networking)
 local SeedData = require(ReplicatedStorage.SharedModules.SeedData)
-local SprinklerData = require(ReplicatedStorage.SharedModules.SprinklerData)
-local WateringcanData = require(ReplicatedStorage.SharedModules.WateringcanData)
 local GearShopData = require(ReplicatedStorage.SharedModules.GearShopData)
 local Worlds = require(ReplicatedStorage.SharedModules.Worlds)
 local FruitValueCalc = require(ReplicatedStorage.SharedModules.FruitValueCalc)
@@ -52,27 +50,27 @@ local C = {
 local R = 10 -- Mail Bypass soft radius
 local UI_NAME = "AupFarmUI"
 local CONFIG_FILE = "AupFarm/config.json"
-local WATER_PRIME_MIN = 1800
 local PLANT_SPACING = 1.2
 -- Game hard-cap: 100 plants per BedSection / FRONT_BedSection (verified: exp3 = 8 beds → 800)
 local PLANTS_PER_BED = 100
 
+-- Kill previous inject's farm loop (re-execute used to leave harvest running)
+local SESSION = (tonumber(_G.AupFarmSession) or 0) + 1
+_G.AupFarmSession = SESSION
+if typeof(_G.AupFarmStop) == "function" then
+	pcall(_G.AupFarmStop)
+end
+
 local State = {
 	running = false,
-	autoPlant = false,
-	autoHarvest = false,
+	autoPlant = true,
+	autoHarvest = true,
 	autoSell = true,
 	dailyDeal = true,
-	mutatedOnly = false,
-	useSprinklers = false,
-	useWatering = false,
-	autoReplaceSprinkler = true,
 	autoBuySeeds = false,
 	autoBuyGears = false,
 	fpsBoost = false,
 	selectedPlant = nil,
-	selectedSprinkler = nil,
-	selectedWateringCan = nil,
 	buySeeds = {},
 	buyGears = {},
 	status = "Idle",
@@ -81,15 +79,13 @@ local State = {
 	sold = 0,
 	bought = 0,
 	sessionStart = os.clock(),
-	lastSprinklerPos = nil,
 }
 
-local cd = { plant = 0, water = 0, spr = 0, sell = 0, buy = 0, harv = 0, care = 0, paintWorth = 0 }
-local plantPaused = false -- true when garden/circle full; cleared only after harvest
-local sprBlockedUntil = 0
+local cd = { plant = 0, sell = 0, buy = 0, harv = 0, paintWorth = 0 }
+local plantPaused = false -- true when garden full; cleared when harvest frees space
 local worthCache = "0"
-local areaCache = { plot = nil, list = nil } -- PlantArea parts (stable)
-local occCache = { plot = nil, t = -1, list = {} } -- occupied plant positions
+local areaCache = { plot = nil, list = nil }
+local occCache = { plot = nil, t = -1, list = {}, buckets = nil }
 local UI = {}
 
 ------------------------------------------------------------------------
@@ -151,15 +147,6 @@ local function itemImage(name)
 	return val(FruitImages) or val(PlantImages) or val(SeedImages) or ""
 end
 
-local function primeOf(n)
-	for _, d in ipairs(SeedData) do
-		if d.SeedName == n then
-			return tonumber(d.PrimeTime) or 0
-		end
-	end
-	return 0
-end
-
 local function worldSeeds(shopOnly)
 	local wid, list = worldId(), {}
 	for _, d in ipairs(SeedData) do
@@ -180,33 +167,12 @@ local function worldSeeds(shopOnly)
 	return list
 end
 
-local function worldSprinklers()
-	local wid, list = worldId(), {}
-	for _, d in ipairs(SprinklerData) do
-		if gearFits(d.SprinklerName, wid) then
-			table.insert(list, { name = d.SprinklerName, image = d.Image })
-		end
-	end
-	return list
-end
-
-local function worldCans()
-	local wid, list = worldId(), {}
-	for _, d in ipairs(WateringcanData) do
-		if gearFits(d.Name, wid) then
-			table.insert(list, { name = d.Name, image = d.Image })
-		end
-	end
-	return list
-end
-
 local function worldGears()
 	local wid, list = worldId(), {}
 	for _, d in ipairs(GearShopData.Data) do
 		if d.HideFromShop or not d.ItemName then
 			continue
 		end
-		-- show everything the gear shop sells for this world
 		local ok = true
 		if type(d.Worlds) == "table" then
 			ok = seedInWorld(d, wid)
@@ -228,27 +194,6 @@ local function worldGears()
 end
 
 local function ensureGear()
-	local s, w = worldSprinklers(), worldCans()
-	local ok = false
-	for _, x in ipairs(s) do
-		if x.name == State.selectedSprinkler then
-			ok = true
-			break
-		end
-	end
-	if not ok then
-		State.selectedSprinkler = s[1] and s[1].name
-	end
-	ok = false
-	for _, x in ipairs(w) do
-		if x.name == State.selectedWateringCan then
-			ok = true
-			break
-		end
-	end
-	if not ok then
-		State.selectedWateringCan = w[1] and w[1].name
-	end
 end
 
 ------------------------------------------------------------------------
@@ -264,16 +209,10 @@ local function saveConfig()
 			autoHarvest = State.autoHarvest,
 			autoSell = State.autoSell,
 			dailyDeal = State.dailyDeal,
-			mutatedOnly = State.mutatedOnly,
-			useSprinklers = State.useSprinklers,
-			useWatering = State.useWatering,
-			autoReplaceSprinkler = State.autoReplaceSprinkler,
 			autoBuySeeds = State.autoBuySeeds,
 			autoBuyGears = State.autoBuyGears,
 			fpsBoost = State.fpsBoost,
 			selectedPlant = State.selectedPlant,
-			selectedSprinkler = State.selectedSprinkler,
-			selectedWateringCan = State.selectedWateringCan,
 			buySeeds = State.buySeeds,
 			buyGears = State.buyGears,
 		}))
@@ -285,7 +224,6 @@ local function loadConfig()
 		if isfile(CONFIG_FILE) then
 			return readfile(CONFIG_FILE)
 		end
-		-- migrate old Grove config once
 		if isfile("GroveFarm/config.json") then
 			return readfile("GroveFarm/config.json")
 		end
@@ -301,9 +239,8 @@ local function loadConfig()
 		return false
 	end
 	for _, k in ipairs({
-		"autoPlant", "autoHarvest", "autoSell", "dailyDeal", "mutatedOnly",
-		"useSprinklers", "useWatering", "autoReplaceSprinkler", "autoBuySeeds", "autoBuyGears", "fpsBoost",
-		"selectedPlant", "selectedSprinkler", "selectedWateringCan",
+		"autoPlant", "autoHarvest", "autoSell", "dailyDeal",
+		"autoBuySeeds", "autoBuyGears", "fpsBoost", "selectedPlant",
 	}) do
 		if data[k] ~= nil then
 			State[k] = data[k]
@@ -315,7 +252,6 @@ local function loadConfig()
 	if type(data.buyGears) == "table" then
 		State.buyGears = data.buyGears
 	end
-	ensureGear()
 	return true
 end
 
@@ -516,20 +452,6 @@ local function findTool(a, v)
 	return scan(LocalPlayer.Character) or scan(LocalPlayer.Backpack)
 end
 
-local function findAny(a)
-	local function scan(c)
-		if not c then
-			return
-		end
-		for _, t in ipairs(c:GetChildren()) do
-			if t:IsA("Tool") and t:GetAttribute(a) ~= nil then
-				return t
-			end
-		end
-	end
-	return scan(LocalPlayer.Character) or scan(LocalPlayer.Backpack)
-end
-
 local function equip(tool)
 	if not tool then
 		return false
@@ -605,18 +527,21 @@ local function gardenAtMax(plot)
 	return gardenCount(plot) >= max
 end
 
+local spotCursor = { plot = nil, ai = 1, x = nil, z = nil }
+
 local function invalidateOcc()
 	occCache.t = -1
+	occCache.buckets = nil
+	spotCursor.plot = nil
 end
 
 local function plantPos(plot)
-	if occCache.plot == plot and (os.clock() - occCache.t) < 0.8 then
-		return occCache.list
+	if occCache.plot == plot and (os.clock() - occCache.t) < 0.8 and occCache.buckets then
+		return occCache.list, occCache.buckets
 	end
-	local t, f = {}, plot:FindFirstChild("Plants")
+	local t, buckets, f = {}, {}, plot:FindFirstChild("Plants")
 	if f then
 		for _, p in ipairs(f:GetChildren()) do
-			-- avoid recursive FindFirstChild / GetPivot on every plant
 			local pos
 			local pp = p.PrimaryPart
 			if not pp then
@@ -639,20 +564,55 @@ local function plantPos(plot)
 			end
 			if pos then
 				table.insert(t, pos)
+				local bx = math.floor(pos.X / 1.05)
+				local bz = math.floor(pos.Z / 1.05)
+				local key = bx .. "," .. bz
+				local bucket = buckets[key]
+				if not bucket then
+					bucket = {}
+					buckets[key] = bucket
+				end
+				table.insert(bucket, pos)
 			end
 		end
 	end
 	occCache.plot = plot
 	occCache.t = os.clock()
 	occCache.list = t
-	return t
+	occCache.buckets = buckets
+	return t, buckets
 end
 
-local function free(pos, occ)
+local function markOcc(pos)
+	if not occCache.buckets then
+		return
+	end
+	table.insert(occCache.list, pos)
+	local bx = math.floor(pos.X / 1.05)
+	local bz = math.floor(pos.Z / 1.05)
+	local key = bx .. "," .. bz
+	local bucket = occCache.buckets[key]
+	if not bucket then
+		bucket = {}
+		occCache.buckets[key] = bucket
+	end
+	table.insert(bucket, pos)
+end
+
+local function free(pos, buckets)
+	local bx = math.floor(pos.X / 1.05)
+	local bz = math.floor(pos.Z / 1.05)
 	local a = Vector2.new(pos.X, pos.Z)
-	for _, o in ipairs(occ) do
-		if (a - Vector2.new(o.X, o.Z)).Magnitude < 1.05 then
-			return false
+	for dx = -1, 1 do
+		for dz = -1, 1 do
+			local bucket = buckets[(bx + dx) .. "," .. (bz + dz)]
+			if bucket then
+				for _, o in ipairs(bucket) do
+					if (a - Vector2.new(o.X, o.Z)).Magnitude < 1.05 then
+						return false
+					end
+				end
+			end
 		end
 	end
 	return true
@@ -664,194 +624,75 @@ local function areas(plot)
 	end
 	local t = {}
 	for _, p in ipairs(CollectionService:GetTagged("PlantArea")) do
-		if p:IsA("BasePart") and p:IsDescendantOf(plot) then
+		-- only real beds (ignore invisible PlantAreaColumn* placeholders)
+		if p:IsA("BasePart") and p:IsDescendantOf(plot) and p.Transparency < 1 and p.CanCollide then
 			table.insert(t, p)
 		end
 	end
+	table.sort(t, function(a, b)
+		return a.Size.X * a.Size.Z > b.Size.X * b.Size.Z
+	end)
 	areaCache.plot = plot
 	areaCache.list = t
 	return t
 end
 
-local function mySpr(plot)
-	local t, f = {}, plot and plot:FindFirstChild("Sprinklers")
-	if not f then
-		return t
-	end
-	for _, s in ipairs(f:GetChildren()) do
-		if s:GetAttribute("UserId") == LocalPlayer.UserId or s:GetAttribute("UserId") == nil then
-			table.insert(t, s)
-		end
-	end
-	return t
-end
-
-local function sprRadius(name)
-	name = name or State.selectedSprinkler
-	for _, d in ipairs(SprinklerData) do
-		if d.SprinklerName == name then
-			return tonumber(d.Radius) or 20
-		end
-	end
-	return 20
-end
-
-local function plotCenter(plot)
-	local ar = areas(plot)
-	table.sort(ar, function(a, b)
-		return a.Size.X * a.Size.Z > b.Size.X * b.Size.Z
-	end)
-	if ar[1] then
-		return (ar[1].CFrame * CFrame.new(0, ar[1].Size.Y * 0.5 + 0.05, 0)).Position
-	end
-	local ok, piv = pcall(function()
-		return plot:GetPivot().Position
-	end)
-	return ok and piv or nil
-end
-
-local function sprCenters(plot)
-	local centers = {}
-	for _, s in ipairs(mySpr(plot)) do
-		local ok, pos = pcall(function()
-			return s:GetPivot().Position
-		end)
-		if ok then
-			table.insert(centers, pos)
-		end
-	end
-	if #centers == 0 and State.lastSprinklerPos then
-		table.insert(centers, State.lastSprinklerPos)
-	end
-	return centers
-end
-
-local function inSprCircle(pos, centers, radius)
-	local p = Vector2.new(pos.X, pos.Z)
-	local r = (radius or sprRadius()) * 0.9 -- stay inside the real coverage
-	for _, c in ipairs(centers) do
-		if (p - Vector2.new(c.X, c.Z)).Magnitude <= r then
-			return true
-		end
-	end
-	return false
-end
-
 local function nextSpot(plot)
-	local occ, ar = plantPos(plot), areas(plot)
-	table.sort(ar, function(a, b)
-		return a.Size.X * a.Size.Z > b.Size.X * b.Size.Z
-	end)
-
-	local centers = sprCenters(plot)
-	local radius = sprRadius()
-	local mustFitSpr = State.useSprinklers == true
-	-- if sprinklers are on but none placed yet, plant at/near center first so we can drop one there
-	if mustFitSpr and #centers == 0 then
-		local c = plotCenter(plot)
-		if c and free(c, occ) then
-			return c
-		end
+	local _, buckets = plantPos(plot)
+	local ar = areas(plot)
+	if #ar == 0 then
+		return nil
 	end
 
-	local bestPos, bestDist = nil, math.huge
+	local startAi = 1
+	local resumeX, resumeZ = nil, nil
+	if spotCursor.plot == plot then
+		startAi = spotCursor.ai or 1
+		resumeX, resumeZ = spotCursor.x, spotCursor.z
+	end
 
-	for _, area in ipairs(ar) do
+	for ai = startAi, #ar do
+		local area = ar[ai]
 		local s, cf = area.Size, area.CFrame
-		for x = -s.X / 2 + PLANT_SPACING * 0.5, s.X / 2 - PLANT_SPACING * 0.4, PLANT_SPACING do
-			for z = -s.Z / 2 + PLANT_SPACING * 0.5, s.Z / 2 - PLANT_SPACING * 0.4, PLANT_SPACING do
+		local x0 = -s.X / 2 + PLANT_SPACING * 0.5
+		local x1 = s.X / 2 - PLANT_SPACING * 0.4
+		local z0 = -s.Z / 2 + PLANT_SPACING * 0.5
+		local z1 = s.Z / 2 - PLANT_SPACING * 0.4
+		local xStart = x0
+		if ai == startAi and resumeX ~= nil then
+			xStart = resumeX
+		end
+		for x = xStart, x1, PLANT_SPACING do
+			local zStart = z0
+			if ai == startAi and resumeX ~= nil and math.abs(x - resumeX) < 1e-6 and resumeZ ~= nil then
+				zStart = resumeZ + PLANT_SPACING
+			end
+			for z = zStart, z1, PLANT_SPACING do
 				local w = (cf * CFrame.new(x, s.Y * 0.5 + 0.05, z)).Position
-				if not free(w, occ) then
-					continue
-				end
-				if mustFitSpr and #centers > 0 and not inSprCircle(w, centers, radius) then
-					continue
-				end
-				-- no sprinkler constraint: first free tile is fine (avoids full-grid sort)
-				if not mustFitSpr or #centers == 0 then
+				if free(w, buckets) then
+					spotCursor.plot = plot
+					spotCursor.ai = ai
+					spotCursor.x = x
+					spotCursor.z = z
 					return w
-				end
-				local p = Vector2.new(w.X, w.Z)
-				local dist = math.huge
-				for _, c in ipairs(centers) do
-					dist = math.min(dist, (p - Vector2.new(c.X, c.Z)).Magnitude)
-				end
-				if dist < bestDist then
-					bestDist = dist
-					bestPos = w
-					if dist < PLANT_SPACING * 0.75 then
-						return bestPos
-					end
 				end
 			end
 		end
-		if bestPos then
-			return bestPos
-		end
+		resumeX, resumeZ = nil, nil
 	end
-	return bestPos
+
+	-- full pass from start if we resumed mid-plot and found nothing
+	if startAi > 1 or resumeX ~= nil then
+		spotCursor.plot = nil
+		return nextSpot(plot)
+	end
+	spotCursor.plot = plot
+	spotCursor.ai = #ar + 1
+	return nil
 end
 
-local function placeSpr(pos, plotId)
-	if not pos or not State.selectedSprinkler or os.clock() - cd.spr < 0.55 then
-		return false
-	end
-	local tool = findTool("Sprinkler", State.selectedSprinkler) or findAny("Sprinkler")
-	if not tool then
-		return false
-	end
-	equip(tool)
-	cd.spr = os.clock()
-	State.lastSprinklerPos = pos
-	local ok = pcall(function()
-		Networking.Place.PlaceSprinkler:Fire(pos, tool:GetAttribute("Sprinkler"), tool, plotId)
-	end)
-	if ok then
-		setStatus("Sprinkler placed")
-	end
-	return ok
-end
-
--- keep one sprinkler on the plot center (coverage circle); replace when gone
-local function ensureSprinkler(plot, plotId)
-	if not State.useSprinklers then
-		return sprCenters(plot)
-	end
-	local active = mySpr(plot)
-	if #active > 0 then
-		sprBlockedUntil = 0
-		local ok, pos = pcall(function()
-			return active[1]:GetPivot().Position
-		end)
-		if ok then
-			State.lastSprinklerPos = pos
-		end
-		return sprCenters(plot)
-	end
-	-- already tried recently and couldn't place — wait until we can again
-	if os.clock() < sprBlockedUntil then
-		return sprCenters(plot)
-	end
-	local tool = findTool("Sprinkler", State.selectedSprinkler) or findAny("Sprinkler")
-	if not tool then
-		sprBlockedUntil = os.clock() + 6
-		setStatus("No sprinkler")
-		return sprCenters(plot)
-	end
-	local pos = State.lastSprinklerPos or plotCenter(plot)
-	if not pos then
-		sprBlockedUntil = os.clock() + 4
-		return sprCenters(plot)
-	end
-	if placeSpr(pos, plotId) then
-		sprBlockedUntil = 0
-	else
-		sprBlockedUntil = os.clock() + 5
-	end
-	return sprCenters(plot)
-end
 local function trySell()
-	if os.clock() - cd.sell < 1.25 then
+	if os.clock() - cd.sell < 1 then
 		return false
 	end
 	cd.sell = os.clock()
@@ -881,11 +722,6 @@ local function space()
 	return not select(1, inv())
 end
 
-local function isMutated(inst)
-	local mut = inst and inst:GetAttribute("Mutation")
-	return type(mut) == "string" and mut ~= "" and mut ~= "None"
-end
-
 local function plantReady(plant)
 	if plant:GetAttribute("PlantGrowthReady") == true then
 		return true
@@ -894,16 +730,48 @@ local function plantReady(plant)
 	if age ~= nil and max ~= nil and max > 0 and age >= max then
 		return true
 	end
-	-- non-recursive first (deep FindFirstChild is a big FPS hit on full plots)
 	if plant:FindFirstChild("HarvestPrompt") then
 		return true
 	end
 	return false
 end
 
-local function tryHarvest()
-	if not State.autoHarvest or os.clock() - cd.harv < 0.4 then
+-- skip re-fire spam on the same plant for a short window
+local harvCooldown = {}
+local tickCleanup = 0
+local plantsWatch = nil
+local plantsWatchConn = nil
+
+local function watchPlantsFolder(folder)
+	if plantsWatch == folder and plantsWatchConn then
 		return
+	end
+	if plantsWatchConn then
+		pcall(function()
+			plantsWatchConn:Disconnect()
+		end)
+		plantsWatchConn = nil
+	end
+	plantsWatch = folder
+	if not folder then
+		return
+	end
+	plantsWatchConn = folder.ChildRemoved:Connect(function()
+		if not State.running then
+			return
+		end
+		State.harvested += 1
+		plantPaused = false
+		invalidateOcc()
+	end)
+end
+
+local function tryHarvest()
+	if not State.autoHarvest then
+		return 0
+	end
+	if os.clock() - cd.harv < 0.03 then
+		return 0
 	end
 	if not space() then
 		if State.autoSell then
@@ -911,19 +779,23 @@ local function tryHarvest()
 		end
 		if not space() then
 			setStatus("Inventory full")
-			return
+			return 0
 		end
 	end
 	local plot = getPlot()
 	if not plot then
-		return
+		return 0
 	end
 	local folder = plot:FindFirstChild("Plants")
 	if not folder then
-		return
+		return 0
 	end
-	local n = 0
+	watchPlantsFolder(folder)
+
 	local maxCap = LocalPlayer:GetAttribute("MaxFruitCapacity") or 100
+	local fired = 0
+	local now = os.clock()
+	cd.harv = now
 
 	for _, plant in ipairs(folder:GetChildren()) do
 		if not State.running or not State.autoHarvest then
@@ -936,34 +808,28 @@ local function tryHarvest()
 		if not pid then
 			continue
 		end
+		local key = tostring(pid)
+		if harvCooldown[key] and now - harvCooldown[key] < 0.35 then
+			continue
+		end
 
-		-- Fall Harvest / many plants: harvest the whole plant (mutation lives on the plant)
 		local fruits = plant:FindFirstChild("Fruits")
 		if not fruits then
 			if not plantReady(plant) then
 				continue
 			end
-			if State.mutatedOnly and not isMutated(plant) then
-				continue
-			end
-			cd.harv = os.clock()
 			if pcall(function()
-				Networking.Garden.CollectFruit:Fire(tostring(pid), "")
+				Networking.Garden.CollectFruit:Fire(key, "")
 			end) then
-				State.harvested += 1
-				n += 1
-				plantPaused = false -- space may be free — allow planting again
-				sprBlockedUntil = 0
-				invalidateOcc()
+				harvCooldown[key] = now
+				fired += 1
 			end
-			if n >= 4 then
-				setStatus("Harvested")
-				return
+			if fired >= 25 then
+				break
 			end
 			continue
 		end
 
-		-- Main-world style: per-fruit harvest
 		for _, fruit in ipairs(fruits:GetChildren()) do
 			if not State.running then
 				break
@@ -971,62 +837,68 @@ local function tryHarvest()
 			if (LocalPlayer:GetAttribute("FruitCount") or 0) >= maxCap then
 				break
 			end
-			local harvestable = fruit:HasTag("Harvestable")
-			if not harvestable and fruit:FindFirstChild("HarvestPrompt") then
-				harvestable = true
-			end
+			local harvestable = fruit:HasTag("Harvestable") or fruit:FindFirstChild("HarvestPrompt") ~= nil
 			if not harvestable then
 				continue
 			end
-			local hasMut = isMutated(fruit) or isMutated(plant)
-			if State.mutatedOnly and not hasMut then
+			local fid = fruit:GetAttribute("FruitId")
+			if fid == nil then
 				continue
 			end
-			local fid = fruit:GetAttribute("FruitId")
-			if fid ~= nil then
-				cd.harv = os.clock()
-				if pcall(function()
-					Networking.Garden.CollectFruit:Fire(tostring(pid), tostring(fid))
-				end) then
-					State.harvested += 1
-					n += 1
-					plantPaused = false
-					sprBlockedUntil = 0
-					invalidateOcc()
-				end
-				if n >= 4 then
-					setStatus("Harvested")
-					return
-				end
+			local fkey = key .. ":" .. tostring(fid)
+			if harvCooldown[fkey] and now - harvCooldown[fkey] < 0.35 then
+				continue
+			end
+			if pcall(function()
+				Networking.Garden.CollectFruit:Fire(key, tostring(fid))
+			end) then
+				harvCooldown[fkey] = now
+				fired += 1
+			end
+			if fired >= 25 then
+				break
+			end
+		end
+		if fired >= 25 then
+			break
+		end
+	end
+
+	if fired > 0 then
+		setStatus("Harvesting")
+	end
+
+	tickCleanup += 1
+	if tickCleanup % 40 == 0 then
+		local cut = now - 3
+		for k, t in pairs(harvCooldown) do
+			if t < cut then
+				harvCooldown[k] = nil
 			end
 		end
 	end
-	if n > 0 then
-		setStatus("Harvested")
-	end
+	return fired
 end
 
 local function tryPlant()
 	if not State.autoPlant or not State.selectedPlant then
 		return
 	end
-	-- full garden: do nothing until harvest clears plantPaused
 	if plantPaused then
 		return
 	end
-	if os.clock() - cd.plant < 0.55 then
+	if os.clock() - cd.plant < 0.04 then
 		return
 	end
-	local plot, plotId = getPlot()
+	local plot = getPlot()
 	if not plot then
 		return
 	end
-	-- hard plant cap from bed count (100/bed) — skip expensive nextSpot when full
 	local max = maxPlants(plot)
 	local count = gardenCount(plot)
 	if max > 0 and count >= max then
 		plantPaused = true
-		setStatus(string.format("Max plants %d/%d · wait harvest", count, max))
+		setStatus("Garden full · harvesting")
 		return
 	end
 	local tool = findTool("SeedTool", State.selectedPlant)
@@ -1034,108 +906,48 @@ local function tryPlant()
 		setStatus("No seeds")
 		return
 	end
-	-- place sprinkler once before scanning spots (avoid double nextSpot)
-	if State.useSprinklers then
-		ensureSprinkler(plot, plotId)
-	end
-	local spot = nextSpot(plot)
-	if not spot then
-		plantPaused = true
-		setStatus(State.useSprinklers and "Circle full · wait harvest" or "Garden full · wait harvest")
-		return
-	end
 	if not equip(tool) then
 		return
 	end
-	cd.plant = os.clock()
-	if pcall(function()
-		Networking.Plant.PlantSeed:Fire(spot, State.selectedPlant, tool)
-	end) then
-		-- optimistic: mark tile occupied so we don't rescan all pivots next tick
-		if occCache.plot == plot then
-			table.insert(occCache.list, spot)
-		else
-			invalidateOcc()
+
+	local plantedNow = 0
+	for _ = 1, 12 do
+		if not State.running or plantPaused then
+			break
 		end
-		-- if this plant hit the hard cap, pause next tick without rescanning
-		if max > 0 and (count + 1) >= max then
+		if max > 0 and count >= max then
 			plantPaused = true
-			setStatus(string.format("Max plants %d/%d · wait harvest", count + 1, max))
+			setStatus("Garden full · harvesting")
+			break
+		end
+		tool = findTool("SeedTool", State.selectedPlant)
+		if not tool then
+			setStatus("No seeds")
+			break
+		end
+		local spot = nextSpot(plot)
+		if not spot then
+			plantPaused = true
+			setStatus("Garden full · harvesting")
+			break
+		end
+		cd.plant = os.clock()
+		if pcall(function()
+			Networking.Plant.PlantSeed:Fire(spot, State.selectedPlant, tool)
+		end) then
+			plantedNow += 1
+			count += 1
+			if occCache.plot == plot then
+				markOcc(spot)
+			else
+				invalidateOcc()
+			end
 		else
-			setStatus("Planted")
+			break
 		end
 	end
-end
-
-local function needing(plot)
-	local t, f = {}, plot:FindFirstChild("Plants")
-	if not f then
-		return t
-	end
-	for _, p in ipairs(f:GetChildren()) do
-		local age, max = tonumber(p:GetAttribute("Age")) or 0, tonumber(p:GetAttribute("MaxAge")) or 0
-		local grown = p:GetAttribute("PlantGrowthReady") == true or (max > 0 and age >= max)
-		if not grown then
-			local ok, pos = pcall(function()
-				return p:GetPivot().Position
-			end)
-			if ok then
-				local sn = p:GetAttribute("SeedName")
-				table.insert(t, { pos = pos, seedName = sn, prime = primeOf(sn or "") })
-			end
-		end
-	end
-	return t
-end
-
-local function replaceSpr()
-	if not (State.useSprinklers and State.autoReplaceSprinkler) then
-		return
-	end
-	local plot, plotId = getPlot()
-	if not plot then
-		return
-	end
-	ensureSprinkler(plot, plotId)
-end
-
-local function tryCare()
-	if os.clock() - cd.care < 1.25 then
-		return
-	end
-	cd.care = os.clock()
-	local plot, plotId = getPlot()
-	if not plot then
-		return
-	end
-	-- only maintain sprinkler if something is still growing
-	local need = needing(plot)
-	if State.useSprinklers and #need > 0 then
-		ensureSprinkler(plot, plotId)
-	end
-	if #need == 0 then
-		return
-	end
-	if State.useWatering and os.clock() - cd.water > 1.0 then
-		local centers = sprCenters(plot)
-		local radius = sprRadius()
-		for _, e in ipairs(need) do
-			if e.prime >= WATER_PRIME_MIN then
-				if State.useSprinklers and #centers > 0 and not inSprCircle(e.pos, centers, radius) then
-					continue
-				end
-				local tool = findTool("WateringCan", State.selectedWateringCan) or findAny("WateringCan")
-				if tool then
-					equip(tool)
-					cd.water = os.clock()
-					pcall(function()
-						Networking.WateringCan.UseWateringCan:Fire(e.pos - Vector3.new(0, 0.3, 0), tool:GetAttribute("WateringCan"), tool)
-					end)
-					setStatus("Watering")
-				end
-				break
-			end
-		end
+	if plantedNow > 0 then
+		setStatus("Planted x" .. plantedNow)
 	end
 end
 
@@ -1210,13 +1022,16 @@ local function tryBuy()
 			buySkip[name] = os.clock() + 5
 			return false
 		end
-		task.wait(0.15)
+		-- don't task.wait here — it freezes the whole farm loop
 		money = wallet()
-		-- if money didn't drop and stock didn't change, likely rejected — back off
-		if price > 0 and money >= before and stock(shop, name) >= qty then
-			buySkip[name] = os.clock() + 6
-			setStatus("Buy blocked")
-			return false
+		local qtyAfter = stock(shop, name)
+		if price > 0 and money >= before and qtyAfter >= qty then
+			-- money/stock may lag a frame; soft backoff, not hard fail
+			buySkip[name] = os.clock() + 1.5
+			State.bought += 1
+			boughtSomething = true
+			setStatus("Bought " .. name)
+			return true
 		end
 		State.bought += 1
 		buySkip[name] = nil
@@ -1252,62 +1067,77 @@ end
 
 local function loop()
 	local tick = 0
-	while State.running do
+	local mySession = SESSION
+	while State.running and _G.AupFarmSession == mySession do
 		pcall(function()
 			tick += 1
-			-- sell only when full (not every tick)
-			if State.autoSell and select(1, inv()) then
+
+			if State.autoSell and (LocalPlayer:GetAttribute("FruitCount") or 0) > 0 then
 				trySell()
 			end
-			-- shop rarely
-			if tick % 5 == 0 then
+
+			if tick % 10 == 0 then
 				tryBuy()
 			end
-			-- skip planting entirely while paused (only harvest clears it)
-			if not plantPaused then
+
+			-- harvest ready every tick; plant whenever there is space
+			tryHarvest()
+			local plot = getPlot()
+			if plot and gardenAtMax(plot) then
+				plantPaused = true
+			else
+				plantPaused = false
 				tryPlant()
 			end
-			tryHarvest()
-			-- care infrequently
-			if tick % 4 == 0 and (State.useSprinklers or State.useWatering) then
-				tryCare()
-			end
-			if tick % 6 == 0 then
+
+			if tick % 10 == 0 then
 				paintStats()
 			end
 		end)
-		-- slower when full (harvest-only); still gentle while planting
-		task.wait(plantPaused and 0.85 or 0.45)
+		task.wait(0.03)
 	end
-	setStatus("Idle")
-	paintStats()
+	if _G.AupFarmSession == mySession then
+		State.running = false
+		setStatus("Idle")
+		paintStats()
+	end
 end
 
 local function startFarm()
 	if State.running then
 		return
 	end
+	State.autoPlant = true
+	State.autoHarvest = true
+	State.autoSell = true
+	State.harvested = 0
 	plantPaused = false
-	sprBlockedUntil = 0
+	table.clear(harvCooldown)
 	invalidateOcc()
 	areaCache.plot = nil
 	areaCache.list = nil
 	State.running = true
-	local plot = select(1, getPlot())
-	if plot and gardenAtMax(plot) then
-		plantPaused = true
-		local c, m = gardenCount(plot), maxPlants(plot)
-		setStatus(string.format("Max plants %d/%d · wait harvest", c, m))
-	else
-		setStatus("Running")
+	local plot = getPlot()
+	if plot then
+		watchPlantsFolder(plot:FindFirstChild("Plants"))
 	end
+	setStatus("Running")
 	task.spawn(loop)
+	task.defer(function()
+		if paints then
+			for _, p in ipairs(paints) do
+				pcall(p)
+			end
+		end
+	end)
 end
 
 local function stopFarm()
 	State.running = false
 	setStatus("Idle")
 end
+
+_G.AupFarmStop = stopFarm
 
 ------------------------------------------------------------------------
 -- UI kit
@@ -1701,6 +1531,12 @@ local old = PlayerGui:FindFirstChild(UI_NAME) or PlayerGui:FindFirstChild("Grove
 if old then
 	old:Destroy()
 end
+-- ensure no leftover farm from a previous execute is still ticking
+pcall(function()
+	if typeof(_G.AupFarmStop) == "function" then
+		_G.AupFarmStop()
+	end
+end)
 
 local gui = Instance.new("ScreenGui")
 gui.Name = UI_NAME
@@ -1878,7 +1714,6 @@ local function addTab(name)
 	end)
 end
 addTab("Farm")
-addTab("Care")
 addTab("Shop")
 addTab("Settings")
 
@@ -2017,26 +1852,21 @@ table.insert(paints, check(autoCard, "Auto Harvest", function()
 end, function(v)
 	State.autoHarvest = v
 end, 3))
-table.insert(paints, check(autoCard, "Only harvest mutated", function()
-	return State.mutatedOnly
-end, function(v)
-	State.mutatedOnly = v
-end, 4))
-table.insert(paints, check(autoCard, "Auto Sell when full", function()
+table.insert(paints, check(autoCard, "Auto Sell every 1s", function()
 	return State.autoSell
 end, function(v)
 	State.autoSell = v
-end, 5))
+end, 4))
 table.insert(paints, check(autoCard, "Prefer Daily Deal", function()
 	return State.dailyDeal
 end, function(v)
 	State.dailyDeal = v
-end, 6))
+end, 5))
 
 local actions = Instance.new("Frame")
 actions.BackgroundTransparency = 1
 actions.Size = UDim2.new(1, 0, 0, 40)
-actions.LayoutOrder = 7
+actions.LayoutOrder = 6
 actions.Parent = autoCard
 hlist(actions, 8)
 
@@ -2092,54 +1922,6 @@ local sellB = button(farm, {
 	order = 3,
 })
 sellB.MouseButton1Click:Connect(trySell)
-
-------------------------------------------------------------------------
--- CARE
-------------------------------------------------------------------------
-local care = page("Care")
-local careCard = card(care, 1)
-sect(careCard, "Growth tools", 1)
-local carePaints = {}
-table.insert(carePaints, check(careCard, "Use sprinklers until grown", function()
-	return State.useSprinklers
-end, function(v)
-	State.useSprinklers = v
-end, 2))
-table.insert(carePaints, check(careCard, "Replace sprinkler when expired", function()
-	return State.autoReplaceSprinkler
-end, function(v)
-	State.autoReplaceSprinkler = v
-end, 3))
-table.insert(carePaints, check(careCard, "Use watering cans (30+ min plants)", function()
-	return State.useWatering
-end, function(v)
-	State.useWatering = v
-end, 4))
-
-local careRow = Instance.new("Frame")
-careRow.BackgroundTransparency = 1
-careRow.Size = UDim2.new(1, 0, 0, 0)
-careRow.AutomaticSize = Enum.AutomaticSize.Y
-careRow.LayoutOrder = 2
-careRow.Parent = care
-hlist(careRow, 14)
-
-local function gearCard(title)
-	local f = Instance.new("Frame")
-	f.BackgroundColor3 = C.card
-	f.BorderSizePixel = 0
-	f.Size = UDim2.new(0.5, -7, 0, 196)
-	f.Parent = careRow
-	corner(f, R)
-	stroke(f, C.line)
-	pad(f, 12)
-	vlist(f, 8)
-	sect(f, title, 1)
-	return hScroll(f, 128, 2)
-end
-
-local sprBox = gearCard("Sprinkler")
-local watBox = gearCard("Watering can")
 
 ------------------------------------------------------------------------
 -- SHOP
@@ -2258,28 +2040,6 @@ local function rebuild()
 		end)
 	end
 
-	clear(sprBox)
-	for _, item in ipairs(worldSprinklers()) do
-		local on = State.selectedSprinkler == item.name
-		local t = tile(sprBox, item.image, item.name:gsub(" Sprinkler", ""):gsub("Syrup ", "Syr "), on, 90, 100)
-		t.MouseButton1Click:Connect(function()
-			State.selectedSprinkler = item.name
-			rebuild()
-			pcall(saveConfig)
-		end)
-	end
-
-	clear(watBox)
-	for _, item in ipairs(worldCans()) do
-		local on = State.selectedWateringCan == item.name
-		local t = tile(watBox, item.image, item.name:gsub(" Watering Can", ""):gsub("Syrup ", "Syr "), on, 96, 100)
-		t.MouseButton1Click:Connect(function()
-			State.selectedWateringCan = item.name
-			rebuild()
-			pcall(saveConfig)
-		end)
-	end
-
 	clear(seedBox)
 	for i, seed in ipairs(worldSeeds(true)) do
 		local on = State.buySeeds[seed.name]
@@ -2359,9 +2119,6 @@ loadB.MouseButton1Click:Connect(function()
 		for _, p in ipairs(paints) do
 			p()
 		end
-		for _, p in ipairs(carePaints) do
-			p()
-		end
 		for _, p in ipairs(shopPaints) do
 			p()
 		end
@@ -2399,16 +2156,6 @@ UserInputService.InputBegan:Connect(function(i, g)
 	if i.KeyCode == Enum.KeyCode.RightShift then
 		gui.Enabled = not gui.Enabled
 	end
-end)
-
-pcall(function()
-	Networking.Garden.SprinklerRemoved.OnClientEvent:Connect(function(uid)
-		if tonumber(uid) == LocalPlayer.UserId or uid == LocalPlayer.UserId then
-			if State.running and State.useSprinklers and State.autoReplaceSprinkler then
-				task.defer(replaceSpr)
-			end
-		end
-	end)
 end)
 
 local lastW = worldId()
